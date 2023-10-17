@@ -1562,8 +1562,7 @@ static const struct file_operations proc_vmstat_file_operations = {
 #ifdef CONFIG_SMP
 static struct workqueue_struct *vmstat_wq;
 static DEFINE_PER_CPU(struct delayed_work, vmstat_work);
-/*xiaomi modify to 10s */
-int sysctl_stat_interval __read_mostly = 10*HZ;
+int sysctl_stat_interval __read_mostly = HZ;
 
 #ifdef CONFIG_PROC_FS
 static void refresh_vm_stats(struct work_struct *work)
@@ -1660,13 +1659,13 @@ static bool need_update(int cpu)
  */
 void quiet_vmstat(void)
 {
-	if (system_state != SYSTEM_RUNNING)
+	if (unlikely(system_state != SYSTEM_RUNNING))
 		return;
 
 	if (!delayed_work_pending(this_cpu_ptr(&vmstat_work)))
 		return;
 
-	if (!need_update(smp_processor_id()))
+	if (likely(!need_update(smp_processor_id())))
 		return;
 
 	/*
@@ -1715,7 +1714,9 @@ static void __init start_shepherd_timer(void)
 		INIT_DEFERRABLE_WORK(per_cpu_ptr(&vmstat_work, cpu),
 			vmstat_update);
 
-	vmstat_wq = alloc_workqueue("vmstat", WQ_FREEZABLE|WQ_MEM_RECLAIM, 0);
+	vmstat_wq = alloc_workqueue("vmstat",
+		WQ_FREEZABLE | WQ_MEM_RECLAIM |
+		WQ_POWER_EFFICIENT, 0);
 	queue_delayed_work(system_power_efficient_wq, &shepherd,
 		round_jiffies_relative(sysctl_stat_interval));
 }

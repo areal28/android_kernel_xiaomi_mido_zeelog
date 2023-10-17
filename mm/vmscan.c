@@ -150,7 +150,7 @@ struct scan_control {
 /*
  * From 0 .. 100.  Higher means more swappy.
  */
-int vm_swappiness = 100;
+int vm_swappiness = 60;
 /*
  * The total number of pages which are beyond the high watermark within all
  * zones.
@@ -1366,7 +1366,7 @@ unsigned long reclaim_clean_pages_from_list(struct zone *zone,
 	return ret;
 }
 
-#ifdef CONFIG_PROCESS_RECLAIM
+#if defined(CONFIG_PROCESS_RECLAIM) || defined(CONFIG_PRLMK)
 unsigned long reclaim_pages_from_list(struct list_head *page_list,
 					struct vm_area_struct *vma)
 {
