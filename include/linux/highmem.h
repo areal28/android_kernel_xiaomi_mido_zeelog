@@ -35,31 +35,7 @@ static inline void invalidate_kernel_vmap_range(void *vaddr, int size)
 
 /* declarations for linux/mm/highmem.c */
 unsigned int nr_free_highpages(void);
-extern atomic_long_t _totalhigh_pages;
-static inline unsigned long totalhigh_pages(void)
-{
-	return (unsigned long)atomic_long_read(&_totalhigh_pages);
-}
-
-static inline void totalhigh_pages_inc(void)
-{
-	atomic_long_inc(&_totalhigh_pages);
-}
-
-static inline void totalhigh_pages_dec(void)
-{
-	atomic_long_dec(&_totalhigh_pages);
-}
-
-static inline void totalhigh_pages_add(long count)
-{
-	atomic_long_add(count, &_totalhigh_pages);
-}
-
-static inline void totalhigh_pages_set(long val)
-{
-	atomic_long_set(&_totalhigh_pages, val);
-}
+extern unsigned long totalhigh_pages;
 
 void kmap_flush_unused(void);
 
@@ -81,7 +57,7 @@ static inline struct page *kmap_to_page(void *addr)
 	return virt_to_page(addr);
 }
 
-static inline unsigned long totalhigh_pages(void) { return 0UL; }
+#define totalhigh_pages 0UL
 
 #ifndef ARCH_HAS_KMAP
 static inline void *kmap(struct page *page)
@@ -96,11 +72,17 @@ static inline void kunmap(struct page *page)
 
 static inline void *kmap_atomic(struct page *page)
 {
+	preempt_disable();
+	pagefault_disable();
 	return page_address(page);
 }
 #define kmap_atomic_prot(page, prot)	kmap_atomic(page)
 
-static inline void __kunmap_atomic(void *addr) {}
+static inline void __kunmap_atomic(void *addr)
+{
+	pagefault_enable();
+	preempt_enable();
+}
 
 #define kmap_atomic_pfn(pfn)	kmap_atomic(pfn_to_page(pfn))
 
@@ -123,6 +105,7 @@ static inline int kmap_atomic_idx_push(void)
 	int idx = __this_cpu_inc_return(__kmap_atomic_idx) - 1;
 
 #ifdef CONFIG_DEBUG_HIGHMEM
+	WARN_ON_ONCE(in_irq() && !irqs_disabled());
 	BUG_ON(idx >= KM_TYPE_NR);
 #endif
 	return idx;
