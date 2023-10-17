@@ -68,6 +68,8 @@ void freeze_set_ops(const struct platform_freeze_ops *ops)
 	unlock_system_sleep();
 }
 
+extern void thaw_fingerprintd(void);
+
 static void freeze_begin(void)
 {
 	suspend_freeze_state = FREEZE_STATE_NONE;
@@ -308,6 +310,7 @@ static int suspend_prepare(suspend_state_t state)
 	if (!error)
 		return 0;
 
+	log_suspend_abort_reason("One or more tasks refusing to freeze");
 	suspend_stats.failed_freeze++;
 	dpm_save_failed_step(SUSPEND_FREEZE);
  Finish:
@@ -337,7 +340,6 @@ void __weak arch_suspend_enable_irqs(void)
  */
 static int suspend_enter(suspend_state_t state, bool *wakeup)
 {
-	char suspend_abort[MAX_SUSPEND_ABORT_LEN];
 	int error, last_dev;
 
 	error = platform_suspend_prepare(state);
@@ -348,7 +350,7 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 	if (error) {
 		last_dev = suspend_stats.last_failed_dev + REC_FAILED_NUM - 1;
 		last_dev %= REC_FAILED_NUM;
-		pr_debug("PM: late suspend of devices failed\n");
+		pr_err("PM: late suspend of devices failed\n");
 		log_suspend_abort_reason("%s device failed to power down",
 			suspend_stats.failed_devs[last_dev]);
 		goto Platform_finish;
@@ -361,7 +363,7 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 	if (error) {
 		last_dev = suspend_stats.last_failed_dev + REC_FAILED_NUM - 1;
 		last_dev %= REC_FAILED_NUM;
-		pr_debug("PM: noirq suspend of devices failed\n");
+		pr_err("PM: noirq suspend of devices failed\n");
 		log_suspend_abort_reason("noirq suspend of %s device failed",
 			suspend_stats.failed_devs[last_dev]);
 		goto Platform_early_resume;
@@ -405,11 +407,10 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 				state, false);
 			events_check_enabled = false;
 		} else if (*wakeup) {
-			pm_get_active_wakeup_sources(suspend_abort,
-				MAX_SUSPEND_ABORT_LEN);
-			log_suspend_abort_reason(suspend_abort);
 			error = -EBUSY;
 		}
+
+		start_logging_wakeup_reasons();
 		syscore_resume();
 	}
 
@@ -420,6 +421,8 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
 	enable_nonboot_cpus();
 
  Platform_wake:
+	thaw_fingerprintd();
+
 	platform_resume_noirq(state);
 	dpm_resume_noirq(PMSG_RESUME);
 
@@ -440,7 +443,7 @@ static int suspend_enter(suspend_state_t state, bool *wakeup)
  */
 int suspend_devices_and_enter(suspend_state_t state)
 {
-	int error, last_dev;
+	int error;
 	bool wakeup = false;
 
 	if (!sleep_state_supported(state))
@@ -454,11 +457,8 @@ int suspend_devices_and_enter(suspend_state_t state)
 	suspend_test_start();
 	error = dpm_suspend_start(PMSG_SUSPEND);
 	if (error) {
-		last_dev = suspend_stats.last_failed_dev + REC_FAILED_NUM - 1;
-		last_dev %= REC_FAILED_NUM;
-		pr_debug("PM: Some devices failed to suspend, or early wake event detected\n");
-		log_suspend_abort_reason("%s device failed to suspend, or early wake event detected",
-			suspend_stats.failed_devs[last_dev]);
+		pr_err("PM: Some devices failed to suspend, or early wake event detected\n");
+		log_suspend_abort_reason("Some devices failed to suspend, or early wake event detected");
 		goto Recover_platform;
 	}
 	suspend_test_finish("suspend devices");
@@ -499,66 +499,6 @@ static void suspend_finish(void)
 	pm_restore_console();
 }
 
-#ifndef CONFIG_SUSPEND_SKIP_SYNC
-/**
- * Sync the filesystem in seperate workqueue.
- * Then check it finishing or not periodically and
- * abort if any wakeup source comes in. That can reduce
- * the wakeup latency
- *
- */
-#define SYS_SYNC_TIMEOUT 1000
-static bool sys_sync_completed = false;
-static void sys_sync_work_func(struct work_struct *work);
-static DECLARE_WORK(sys_sync_work, sys_sync_work_func);
-static DECLARE_WAIT_QUEUE_HEAD(sys_sync_wait);
-static void sys_sync_work_func(struct work_struct *work)
-{
-#ifdef CONFIG_SUSPEND_LOG_DEBUG
-	pr_info("PM: Syncing filesystems ... \n");
-#endif
-	sys_sync();
-	sys_sync_completed = true;
-	wake_up(&sys_sync_wait);
-}
-
-static int sys_sync_queue(void)
-{
-	int work_status = work_busy(&sys_sync_work);
-
-	/*Check if the previous work still running.*/
-	if (!(work_status & WORK_BUSY_PENDING)) {
-		if (work_status & WORK_BUSY_RUNNING) {
-			while (wait_event_timeout(sys_sync_wait, sys_sync_completed,
-						msecs_to_jiffies(SYS_SYNC_TIMEOUT)) == 0) {
-				if (pm_wakeup_pending()) {
-					pr_info("PM: Pre-Syncing abort\n");
-					goto abort;
-				}
-			}
-			pr_info("PM: Pre-Syncing done\n");
-		}
-		sys_sync_completed = false;
-		schedule_work(&sys_sync_work);
-	}
-
-	while (wait_event_timeout(sys_sync_wait, sys_sync_completed,
-					msecs_to_jiffies(SYS_SYNC_TIMEOUT)) == 0) {
-		if (pm_wakeup_pending()) {
-			pr_info("PM: Syncing abort\n");
-			goto abort;
-		}
-	}
-
-#ifdef CONFIG_SUSPEND_LOG_DEBUG
-	pr_info("PM: Syncing done\n");
-#endif
-	return 0;
-abort:
-	return -EAGAIN;
-}
-#endif
-
 /**
  * enter_state - Do common work needed to enter system sleep state.
  * @state: System sleep state to enter.
@@ -590,9 +530,9 @@ static int enter_state(suspend_state_t state)
 
 #ifndef CONFIG_SUSPEND_SKIP_SYNC
 	trace_suspend_resume(TPS("sync_filesystems"), 0, true);
-	error = sys_sync_queue();
-	if (error)
-		goto Unlock;
+	pr_info("PM: Syncing filesystems ... ");
+	sys_sync();
+	pr_cont("done.\n");
 	trace_suspend_resume(TPS("sync_filesystems"), 0, false);
 #endif
 

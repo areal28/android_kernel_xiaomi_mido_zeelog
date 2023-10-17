@@ -37,9 +37,6 @@ static int try_to_freeze_tasks(bool user_only)
 	unsigned int elapsed_msecs;
 	bool wakeup = false;
 	int sleep_usecs = USEC_PER_MSEC;
-#ifdef CONFIG_PM_SLEEP
-	char suspend_abort[MAX_SUSPEND_ABORT_LEN];
-#endif
 
 	start = ktime_get_boottime();
 
@@ -69,11 +66,6 @@ static int try_to_freeze_tasks(bool user_only)
 			break;
 
 		if (pm_wakeup_pending()) {
-#ifdef CONFIG_PM_SLEEP
-			pm_get_active_wakeup_sources(suspend_abort,
-				MAX_SUSPEND_ABORT_LEN);
-			log_suspend_abort_reason(suspend_abort);
-#endif
 			wakeup = true;
 			break;
 		}
@@ -114,10 +106,8 @@ static int try_to_freeze_tasks(bool user_only)
 		}
 		read_unlock(&tasklist_lock);
 	} else {
-#ifdef CONFIG_SUSPEND_LOG_DEBUG
 		pr_cont("(elapsed %d.%03d seconds) ", elapsed_msecs / 1000,
 			elapsed_msecs % 1000);
-#endif
 	}
 
 	return todo ? -EBUSY : 0;
@@ -145,23 +135,17 @@ int freeze_processes(void)
 		atomic_inc(&system_freezing_cnt);
 
 	pm_wakeup_clear();
-#ifdef CONFIG_SUSPEND_LOG_DEBUG
-	pr_debug("Freezing user space processes ... ");
-#endif
+	pr_info("Freezing user space processes ... ");
 	pm_freezing = true;
 	error = try_to_freeze_tasks(true);
 	if (!error) {
 		__usermodehelper_set_disable_depth(UMH_DISABLED);
-#ifdef CONFIG_SUSPEND_LOG_DEBUG
 		pr_cont("done.");
-#endif
-
 	}
-#ifdef CONFIG_SUSPEND_LOG_DEBUG
 	pr_cont("\n");
-#endif
 	BUG_ON(in_atomic());
 
+#ifndef CONFIG_ANDROID
 	/*
 	 * Now that the whole userspace is frozen we need to disbale
 	 * the OOM killer to disallow any further interference with
@@ -170,6 +154,7 @@ int freeze_processes(void)
 	 */
 	if (!error && !oom_killer_disable(msecs_to_jiffies(freeze_timeout_msecs)))
 		error = -EBUSY;
+#endif
 
 	if (error)
 		thaw_processes();
@@ -188,23 +173,43 @@ int freeze_kernel_threads(void)
 {
 	int error;
 
-#ifdef CONFIG_SUSPEND_LOG_DEBUG
-	pr_debug("Freezing remaining freezable tasks ... ");
-#endif
+	pr_info("Freezing remaining freezable tasks ... ");
 
 	pm_nosig_freezing = true;
 	error = try_to_freeze_tasks(false);
-#ifdef CONFIG_SUSPEND_LOG_DEBUG
 	if (!error)
 		pr_cont("done.");
 
 	pr_cont("\n");
-#endif
 	BUG_ON(in_atomic());
 
 	if (error)
 		thaw_kernel_threads();
 	return error;
+}
+
+void thaw_fingerprintd(void)
+{
+	struct task_struct *p;
+
+	pm_freezing = false;
+	pm_nosig_freezing = false;
+
+	read_lock(&tasklist_lock);
+	for_each_process(p) {
+		if ((!memcmp(p->comm, "android.hardware.biometrics.fingerprint@2.1-service", 13)) ||
+			(!memcmp(p->comm,"android.hardware.biometrics.fingerprint@2.1-service.xiaomi_msm8953", 13)) ||
+			(!memcmp(p->comm,"android.hardware.biometrics.fingerprint@2.1-service.custom", 13)) ||
+			(!memcmp(p->comm,"android.hardware.biometrics.fingerprint@2.1-service.land", 13)) ||
+			(!memcmp(p->comm,"gx_fpd", 13))) {
+			__thaw_task(p);
+			break;
+		}
+	}
+	read_unlock(&tasklist_lock);
+
+	pm_freezing = true;
+	pm_nosig_freezing = true;
 }
 
 void thaw_processes(void)
@@ -218,9 +223,11 @@ void thaw_processes(void)
 	pm_freezing = false;
 	pm_nosig_freezing = false;
 
+#ifndef CONFIG_ANDROID
 	oom_killer_enable();
+#endif
 
-	pr_debug("Restarting tasks ... ");
+	pr_info("Restarting tasks ... ");
 
 	__usermodehelper_set_disable_depth(UMH_FREEZING);
 	thaw_workqueues();
@@ -241,9 +248,7 @@ void thaw_processes(void)
 	usermodehelper_enable();
 
 	schedule();
-#ifdef CONFIG_SUSPEND_LOG_DEBUG
 	pr_cont("done.\n");
-#endif
 	trace_suspend_resume(TPS("thaw_processes"), 0, false);
 }
 
@@ -252,7 +257,7 @@ void thaw_kernel_threads(void)
 	struct task_struct *g, *p;
 
 	pm_nosig_freezing = false;
-	pr_debug("Restarting kernel threads ... ");
+	pr_info("Restarting kernel threads ... ");
 
 	thaw_workqueues();
 
@@ -264,7 +269,5 @@ void thaw_kernel_threads(void)
 	read_unlock(&tasklist_lock);
 
 	schedule();
-#ifdef CONFIG_SUSPEND_LOG_DEBUG
 	pr_cont("done.\n");
-#endif
 }

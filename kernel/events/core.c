@@ -573,7 +573,7 @@ void perf_sample_event_took(u64 sample_len_ns)
 	WRITE_ONCE(perf_sample_allowed_ns, avg_len);
 	WRITE_ONCE(max_samples_per_tick, max);
 
-	sysctl_perf_event_sample_rate = max * HZ;
+	sysctl_perf_event_sample_rate = max * msecs_to_jiffies(1000);
 	perf_sample_period_ns = NSEC_PER_SEC / sysctl_perf_event_sample_rate;
 
 	if (!irq_work_queue(&perf_duration_work)) {
@@ -1053,7 +1053,7 @@ list_update_cgroup_event(struct perf_event *event,
  * set default to be dependent on timer tick just
  * like original code
  */
-#define PERF_CPU_HRTIMER (1000 / HZ)
+#define PERF_CPU_HRTIMER 1
 /*
  * function must be called with interrupts disbled
  */
@@ -1093,7 +1093,7 @@ static void __perf_mux_hrtimer_init(struct perf_cpu_context *cpuctx, int cpu)
 	 */
 	interval = pmu->hrtimer_interval_ms;
 	if (interval < 1)
-		interval = pmu->hrtimer_interval_ms = PERF_CPU_HRTIMER;
+		interval = pmu->hrtimer_interval_ms = msecs_to_jiffies(PERF_CPU_HRTIMER);
 
 	cpuctx->hrtimer_interval = ns_to_ktime(NSEC_PER_MSEC * interval);
 
@@ -3873,11 +3873,9 @@ find_get_context(struct pmu *pmu, struct task_struct *task,
 
 	if (!task) {
 		/* Must be root to operate on a CPU event: */
-		if (!is_kernel_event(event)) {
-			err = perf_allow_cpu(&event->attr);
-			if (err)
-				return ERR_PTR(err);
-		}
+		if (!is_kernel_event(event) && perf_paranoid_cpu() &&
+			!capable(CAP_SYS_ADMIN))
+			return ERR_PTR(-EACCES);
 
 		/*
 		 * We could be clever and allow to attach a event to an
@@ -4078,7 +4076,7 @@ static void unaccount_event(struct perf_event *event)
 
 	if (dec) {
 		if (!atomic_add_unless(&perf_sched_count, -1, 1))
-			schedule_delayed_work(&perf_sched_work, HZ);
+			schedule_delayed_work(&perf_sched_work, msecs_to_jiffies(1000));
 	}
 
 	unaccount_event_cpu(event, event->cpu);
@@ -4216,8 +4214,6 @@ static void _free_event(struct perf_event *event)
 	irq_work_sync(&event->pending);
 
 	unaccount_event(event);
-
-	security_perf_event_free(event);
 
 	if (event->rb) {
 		/*
@@ -4670,10 +4666,6 @@ perf_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 	struct perf_event_context *ctx;
 	int ret;
 
-	ret = security_perf_event_read(event);
-	if (ret)
-		return ret;
-
 #if defined CONFIG_HOTPLUG_CPU || defined CONFIG_KEXEC_CORE
 	spin_lock(&dormant_event_list_lock);
 	if (event->state == PERF_EVENT_STATE_DORMANT) {
@@ -4930,11 +4922,6 @@ static long perf_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct perf_event *event = file->private_data;
 	struct perf_event_context *ctx;
 	long ret;
-
-	/* Treat ioctl like writes as it is likely a mutating operation. */
-	ret = security_perf_event_write(event);
-	if (ret)
-		return ret;
 
 	ctx = perf_event_ctx_lock(event);
 	ret = _perf_ioctl(event, cmd, arg);
@@ -5397,10 +5384,6 @@ static int perf_mmap(struct file *file, struct vm_area_struct *vma)
 	if (!(vma->vm_flags & VM_SHARED))
 		return -EINVAL;
 
-	ret = security_perf_event_read(event);
-	if (ret)
-		return ret;
-
 	vma_size = vma->vm_end - vma->vm_start;
 
 	if (vma->vm_pgoff == 0) {
@@ -5522,7 +5505,7 @@ accounting:
 	lock_limit >>= PAGE_SHIFT;
 	locked = vma->vm_mm->pinned_vm + extra;
 
-	if ((locked > lock_limit) && perf_is_paranoid() &&
+	if ((locked > lock_limit) && perf_paranoid_tracepoint_raw() &&
 		!capable(CAP_IPC_LOCK)) {
 		ret = -EPERM;
 		goto unlock;
@@ -9692,20 +9675,11 @@ perf_event_alloc(struct perf_event_attr *attr, int cpu,
 		}
 	}
 
-	err = security_perf_event_alloc(event);
-	if (err)
-		goto err_callchain_buffer;
-
 	/* symmetric to unaccount_event() in _free_event() */
 	account_event(event);
 
 	return event;
 
-err_callchain_buffer:
-	if (!event->parent) {
-		if (event->attr.sample_type & PERF_SAMPLE_CALLCHAIN)
-			put_callchain_buffers();
-	}
 err_addr_filters:
 	kfree(event->addr_filters_offs);
 
@@ -9821,11 +9795,9 @@ static int perf_copy_attr(struct perf_event_attr __user *uattr,
 			attr->branch_sample_type = mask;
 		}
 		/* privileged levels capture (kernel, hv): check permissions */
-		if (mask & PERF_SAMPLE_BRANCH_PERM_PLM) {
-			ret = perf_allow_kernel(attr);
-			if (ret)
-				return ret;
-		}
+		if ((mask & PERF_SAMPLE_BRANCH_PERM_PLM)
+		    && perf_paranoid_kernel() && !capable(CAP_SYS_ADMIN))
+			return -EACCES;
 	}
 
 	if (attr->sample_type & PERF_SAMPLE_REGS_USER) {
@@ -10080,19 +10052,13 @@ SYSCALL_DEFINE5(perf_event_open,
 	if (perf_paranoid_any() && !capable(CAP_SYS_ADMIN))
 		return -EACCES;
 
-	/* Do we allow access to perf_event_open(2) ? */
-	err = security_perf_event_open(&attr, PERF_SECURITY_OPEN);
-	if (err)
-		return err;
-
 	err = perf_copy_attr(attr_uptr, &attr);
 	if (err)
 		return err;
 
 	if (!attr.exclude_kernel) {
-		err = perf_allow_kernel(&attr);
-		if (err)
-			return err;
+		if (perf_paranoid_kernel() && !capable(CAP_SYS_ADMIN))
+			return -EACCES;
 	}
 
 	if (attr.freq) {
