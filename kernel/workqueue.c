@@ -69,7 +69,7 @@ enum {
 	 * be executing on any CPU.  The pool behaves as an unbound one.
 	 *
 	 * Note that DISASSOCIATED should be flipped only while holding
-	 * attach_mutex to avoid changing binding state while
+	 * wq_pool_attach_mutex to avoid changing binding state while
 	 * worker_attach_to_pool() is in progress.
 	 */
 	POOL_MANAGER_ACTIVE	= 1 << 0,	/* being managed */
@@ -92,13 +92,13 @@ enum {
 	BUSY_WORKER_HASH_ORDER	= 6,		/* 64 pointers */
 
 	MAX_IDLE_WORKERS_RATIO	= 4,		/* 1/4 of busy can be idle */
-	IDLE_WORKER_TIMEOUT	= 300 * HZ,	/* keep idle ones for 5 mins */
+	IDLE_WORKER_TIMEOUT	= 300000,	/* keep idle ones for 5 mins */
 
-	MAYDAY_INITIAL_TIMEOUT  = HZ / 100 >= 2 ? HZ / 100 : 2,
+	MAYDAY_INITIAL_TIMEOUT  = 10 >= 2 ? 10 : 2,
 						/* call for help after 10ms
 						   (min two ticks) */
-	MAYDAY_INTERVAL		= HZ / 10,	/* and then every 100ms */
-	CREATE_COOLDOWN		= HZ,		/* time to breath after fail */
+	MAYDAY_INTERVAL		= 100,		/* and then every 100ms */
+	CREATE_COOLDOWN		= 1000,		/* time to breath after fail */
 
 	/*
 	 * Rescue workers are used only on emergencies and shared by
@@ -126,7 +126,7 @@ enum {
  *    cpu or grabbing pool->lock is enough for read access.  If
  *    POOL_DISASSOCIATED is set, it's identical to L.
  *
- * A: pool->attach_mutex protected.
+ * A: wq_pool_attach_mutex protected.
  *
  * PL: wq_pool_mutex protected.
  *
@@ -171,7 +171,6 @@ struct worker_pool {
 
 	/* see manage_workers() for details on the two manager mutexes */
 	struct worker		*manager;	/* L: purely informational */
-	struct mutex		attach_mutex;	/* attach/detach exclusion */
 	struct list_head	workers;	/* A: attached workers */
 	struct completion	*detach_completion; /* all workers detached */
 
@@ -292,7 +291,9 @@ module_param_named(disable_numa, wq_disable_numa, bool, 0444);
 
 /* see the comment above the definition of WQ_POWER_EFFICIENT */
 static bool wq_power_efficient = IS_ENABLED(CONFIG_WQ_POWER_EFFICIENT_DEFAULT);
-module_param_named(power_efficient, wq_power_efficient, bool, 0444);
+module_param_named(power_efficient, wq_power_efficient, bool, 0644);
+
+bool wq_online;				/* can kworkers be created yet? */
 
 bool wq_online;				/* can kworkers be created yet? */
 
@@ -302,6 +303,7 @@ static bool wq_numa_enabled;		/* unbound NUMA affinity enabled */
 static struct workqueue_attrs *wq_update_unbound_numa_attrs_buf;
 
 static DEFINE_MUTEX(wq_pool_mutex);	/* protects pools and workqueues list */
+static DEFINE_MUTEX(wq_pool_attach_mutex); /* protects worker attach/detach */
 static DEFINE_SPINLOCK(wq_mayday_lock);	/* protects wq->maydays list */
 static DECLARE_WAIT_QUEUE_HEAD(wq_manager_wait); /* wait for manager to go away */
 
@@ -404,14 +406,14 @@ static void workqueue_sysfs_unregister(struct workqueue_struct *wq);
  * @worker: iteration cursor
  * @pool: worker_pool to iterate workers of
  *
- * This must be called with @pool->attach_mutex.
+ * This must be called with wq_pool_attach_mutex.
  *
  * The if/else clause exists only for the lockdep assertion and can be
  * ignored.
  */
 #define for_each_pool_worker(worker, pool)				\
 	list_for_each_entry((worker), &(pool)->workers, node)		\
-		if (({ lockdep_assert_held(&pool->attach_mutex); false; })) { } \
+		if (({ lockdep_assert_held(&wq_pool_attach_mutex); false; })) { } \
 		else
 
 /**
@@ -1664,7 +1666,7 @@ static void worker_enter_idle(struct worker *worker)
 	list_add(&worker->entry, &pool->idle_list);
 
 	if (too_many_workers(pool) && !timer_pending(&pool->idle_timer))
-		mod_timer(&pool->idle_timer, jiffies + IDLE_WORKER_TIMEOUT);
+		mod_timer(&pool->idle_timer, jiffies + msecs_to_jiffies(IDLE_WORKER_TIMEOUT));
 
 	/*
 	 * Sanity check nr_running.  Because unbind_workers() releases
@@ -1724,7 +1726,7 @@ static struct worker *alloc_worker(int node)
 static void worker_attach_to_pool(struct worker *worker,
 				   struct worker_pool *pool)
 {
-	mutex_lock(&pool->attach_mutex);
+	mutex_lock(&wq_pool_attach_mutex);
 
 	/*
 	 * set_cpus_allowed_ptr() will fail if the cpumask doesn't have any
@@ -1733,16 +1735,16 @@ static void worker_attach_to_pool(struct worker *worker,
 	set_cpus_allowed_ptr(worker->task, pool->attrs->cpumask);
 
 	/*
-	 * The pool->attach_mutex ensures %POOL_DISASSOCIATED remains
-	 * stable across this function.  See the comments above the
-	 * flag definition for details.
+	 * The wq_pool_attach_mutex ensures %POOL_DISASSOCIATED remains
+	 * stable across this function.  See the comments above the flag
+	 * definition for details.
 	 */
 	if (pool->flags & POOL_DISASSOCIATED)
 		worker->flags |= WORKER_UNBOUND;
 
 	list_add_tail(&worker->node, &pool->workers);
 
-	mutex_unlock(&pool->attach_mutex);
+	mutex_unlock(&wq_pool_attach_mutex);
 }
 
 /**
@@ -1759,11 +1761,11 @@ static void worker_detach_from_pool(struct worker *worker,
 {
 	struct completion *detach_completion = NULL;
 
-	mutex_lock(&pool->attach_mutex);
+	mutex_lock(&wq_pool_attach_mutex);
 	list_del(&worker->node);
 	if (list_empty(&pool->workers))
 		detach_completion = pool->detach_completion;
-	mutex_unlock(&pool->attach_mutex);
+	mutex_unlock(&wq_pool_attach_mutex);
 
 	/* clear leftover flags without pool->lock after it is detached */
 	worker->flags &= ~(WORKER_UNBOUND | WORKER_REBOUND);
@@ -1877,7 +1879,7 @@ static void idle_worker_timeout(unsigned long __pool)
 
 		/* idle_list is kept in LIFO order, check the last one */
 		worker = list_entry(pool->idle_list.prev, struct worker, entry);
-		expires = worker->last_active + IDLE_WORKER_TIMEOUT;
+		expires = worker->last_active + msecs_to_jiffies(IDLE_WORKER_TIMEOUT);
 
 		if (time_before(jiffies, expires)) {
 			mod_timer(&pool->idle_timer, expires);
@@ -1935,7 +1937,7 @@ static void pool_mayday_timeout(unsigned long __pool)
 	spin_unlock(&wq_mayday_lock);
 	spin_unlock_irq(&pool->lock);
 
-	mod_timer(&pool->mayday_timer, jiffies + MAYDAY_INTERVAL);
+	mod_timer(&pool->mayday_timer, jiffies + msecs_to_jiffies(MAYDAY_INTERVAL));
 }
 
 /**
@@ -1964,13 +1966,13 @@ restart:
 	spin_unlock_irq(&pool->lock);
 
 	/* if we don't make progress in MAYDAY_INITIAL_TIMEOUT, call for help */
-	mod_timer(&pool->mayday_timer, jiffies + MAYDAY_INITIAL_TIMEOUT);
+	mod_timer(&pool->mayday_timer, jiffies + msecs_to_jiffies(MAYDAY_INITIAL_TIMEOUT));
 
 	while (true) {
 		if (create_worker(pool) || !need_to_create_worker(pool))
 			break;
 
-		schedule_timeout_interruptible(CREATE_COOLDOWN);
+		schedule_timeout_interruptible(msecs_to_jiffies(CREATE_COOLDOWN));
 
 		if (!need_to_create_worker(pool))
 			break;
@@ -3252,7 +3254,6 @@ static int init_worker_pool(struct worker_pool *pool)
 	setup_timer(&pool->mayday_timer, pool_mayday_timeout,
 		    (unsigned long)pool);
 
-	mutex_init(&pool->attach_mutex);
 	INIT_LIST_HEAD(&pool->workers);
 
 	ida_init(&pool->worker_ida);
@@ -3335,10 +3336,10 @@ static void put_unbound_pool(struct worker_pool *pool)
 	WARN_ON(pool->nr_workers || pool->nr_idle);
 	spin_unlock_irq(&pool->lock);
 
-	mutex_lock(&pool->attach_mutex);
+	mutex_lock(&wq_pool_attach_mutex);
 	if (!list_empty(&pool->workers))
 		pool->detach_completion = &detach_completion;
-	mutex_unlock(&pool->attach_mutex);
+	mutex_unlock(&wq_pool_attach_mutex);
 
 	if (pool->detach_completion)
 		wait_for_completion(pool->detach_completion);
@@ -4590,7 +4591,7 @@ static void unbind_workers(int cpu)
 	struct worker *worker;
 
 	for_each_cpu_worker_pool(pool, cpu) {
-		mutex_lock(&pool->attach_mutex);
+		mutex_lock(&wq_pool_attach_mutex);
 		spin_lock_irq(&pool->lock);
 
 		/*
@@ -4606,7 +4607,7 @@ static void unbind_workers(int cpu)
 		pool->flags |= POOL_DISASSOCIATED;
 
 		spin_unlock_irq(&pool->lock);
-		mutex_unlock(&pool->attach_mutex);
+		mutex_unlock(&wq_pool_attach_mutex);
 
 		/*
 		 * Call schedule() so that we cross rq->lock and thus can
@@ -4647,7 +4648,7 @@ static void rebind_workers(struct worker_pool *pool)
 {
 	struct worker *worker;
 
-	lockdep_assert_held(&pool->attach_mutex);
+	lockdep_assert_held(&wq_pool_attach_mutex);
 
 	/*
 	 * Restore CPU affinity of all workers.  As all idle workers should
@@ -4727,7 +4728,7 @@ static void restore_unbound_workers_cpumask(struct worker_pool *pool, int cpu)
 	static cpumask_t cpumask;
 	struct worker *worker;
 
-	lockdep_assert_held(&pool->attach_mutex);
+	lockdep_assert_held(&wq_pool_attach_mutex);
 
 	/* is @cpu allowed for @pool? */
 	if (!cpumask_test_cpu(cpu, pool->attrs->cpumask))
@@ -4762,14 +4763,14 @@ int workqueue_online_cpu(unsigned int cpu)
 	mutex_lock(&wq_pool_mutex);
 
 	for_each_pool(pool, pi) {
-		mutex_lock(&pool->attach_mutex);
+		mutex_lock(&wq_pool_attach_mutex);
 
 		if (pool->cpu == cpu)
 			rebind_workers(pool);
 		else if (pool->cpu < 0)
 			restore_unbound_workers_cpumask(pool, cpu);
 
-		mutex_unlock(&pool->attach_mutex);
+		mutex_unlock(&wq_pool_attach_mutex);
 	}
 
 	/* update NUMA affinity of unbound workqueues */
@@ -5435,7 +5436,7 @@ static void wq_watchdog_reset_touched(void)
 
 static void wq_watchdog_timer_fn(unsigned long data)
 {
-	unsigned long thresh = READ_ONCE(wq_watchdog_thresh) * HZ;
+	unsigned long thresh = READ_ONCE(wq_watchdog_thresh) * msecs_to_jiffies(1000);
 	bool lockup_detected = false;
 	unsigned long now = jiffies;
 	struct worker_pool *pool;
@@ -5510,7 +5511,7 @@ static void wq_watchdog_set_thresh(unsigned long thresh)
 	if (thresh) {
 		wq_watchdog_thresh = thresh;
 		wq_watchdog_reset_touched();
-		mod_timer(&wq_watchdog_timer, jiffies + thresh * HZ);
+		mod_timer(&wq_watchdog_timer, jiffies + thresh * msecs_to_jiffies(1000));
 	}
 }
 

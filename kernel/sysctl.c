@@ -134,6 +134,7 @@ static unsigned long one_ul = 1;
 static unsigned long long_max = LONG_MAX;
 static int one_hundred = 100;
 static int __maybe_unused one_thousand = 1000;
+static int max_swappiness = 200;
 #ifdef CONFIG_SCHED_WALT
 static int two_million = 2000000;
 #endif
@@ -143,7 +144,6 @@ static int ten_thousand = 10000;
 #ifdef CONFIG_PERF_EVENTS
 static int six_hundred_forty_kb = 640 * 1024;
 #endif
-static int two_hundred_fifty_five = 255;
 
 /* this is needed for the proc_doulongvec_minmax of vm_dirty_bytes */
 static unsigned long dirty_bytes_min = 2 * PAGE_SIZE;
@@ -370,6 +370,7 @@ static struct ctl_table kern_table[] = {
 		.extra1		= &zero,
 		.extra2		= &sysctl_sched_group_upmigrate_pct,
 	},
+#if 0
 	{
 		.procname	= "sched_boost",
 		.data		= &sysctl_sched_boost,
@@ -379,6 +380,7 @@ static struct ctl_table kern_table[] = {
 		.extra1         = &zero,
 		.extra2		= &three,
 	},
+#endif
 	{
 		.procname	= "sched_walt_rotate_big_tasks",
 		.data		= &sysctl_sched_walt_rotate_big_tasks,
@@ -627,22 +629,21 @@ static struct ctl_table kern_table[] = {
 		.extra1		= &one,
 	},
 #endif
+#ifdef CONFIG_SCHED_TUNE
 	{
-		.procname	= "sched_lib_name",
-		.data		= sched_lib_name,
-		.maxlen		= LIB_PATH_LENGTH,
+		.procname	= "sched_cfs_boost",
+		.data		= &sysctl_sched_cfs_boost,
+		.maxlen		= sizeof(sysctl_sched_cfs_boost),
+#ifdef CONFIG_CGROUP_SCHEDTUNE
+		.mode		= 0444,
+#else
 		.mode		= 0644,
-		.proc_handler	= sysctl_sched_lib_name_handler,
-	},
-	{
-		.procname	= "sched_lib_mask_force",
-		.data		= &sched_lib_mask_force,
-		.maxlen		= sizeof(unsigned int),
-		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
+#endif
+		.proc_handler	= &sysctl_sched_cfs_boost_handler,
 		.extra1		= &zero,
-		.extra2		= &two_hundred_fifty_five,
+		.extra2		= &one_hundred,
 	},
+#endif
 #ifdef CONFIG_PROVE_LOCKING
 	{
 		.procname	= "prove_locking",
@@ -1581,7 +1582,7 @@ static struct ctl_table vm_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= &zero,
-		.extra2		= &one_hundred,
+		.extra2		= &max_swappiness,
 	},
 	{
 		.procname       = "want_old_faultaround_pte",

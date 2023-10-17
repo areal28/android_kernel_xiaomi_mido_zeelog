@@ -26,9 +26,8 @@
 #include <linux/smpboot.h>
 #include <linux/relay.h>
 #include <linux/slab.h>
-#include <linux/random.h>
 #include <linux/highmem.h>
-#include <linux/cpuset.h>
+#include <linux/random.h>
 
 #include <trace/events/power.h>
 #define CREATE_TRACE_POINTS
@@ -249,6 +248,12 @@ static struct {
 				  lock_map_acquire_tryread(&cpu_hotplug.dep_map)
 #define cpuhp_lock_acquire()      lock_map_acquire(&cpu_hotplug.dep_map)
 #define cpuhp_lock_release()      lock_map_release(&cpu_hotplug.dep_map)
+
+void cpu_hotplug_mutex_held(void)
+{
+	lockdep_assert_held(&cpu_hotplug.lock);
+}
+EXPORT_SYMBOL(cpu_hotplug_mutex_held);
 
 void get_online_cpus(void)
 {
@@ -505,6 +510,7 @@ static int notify_online(unsigned int cpu)
 	cpu_notify(CPU_ONLINE, cpu);
 	return 0;
 }
+static void __cpuhp_kick_ap_work(struct cpuhp_cpu_state *st);
 
 static void __cpuhp_kick_ap_work(struct cpuhp_cpu_state *st);
 
@@ -817,52 +823,6 @@ void __unregister_cpu_notifier(struct notifier_block *nb)
 }
 EXPORT_SYMBOL(__unregister_cpu_notifier);
 
-/*
- *
- * Serialize hotplug trainwrecks outside of the cpu_hotplug_lock
- * protected region.
- *
- * The operation is still serialized against concurrent CPU hotplug via
- * cpu_add_remove_lock, i.e. CPU map protection.  But it is _not_
- * serialized against other hotplug related activity like adding or
- * removing of state callbacks and state instances, which invoke either the
- * startup or the teardown callback of the affected state.
- *
- * This is required for subsystems which are unfixable vs. CPU hotplug and
- * evade lock inversion problems by scheduling work which has to be
- * completed _before_ cpu_up()/_cpu_down() returns.
- *
- * Don't even think about adding anything to this for any new code or even
- * drivers. It's only purpose is to keep existing lock order trainwrecks
- * working.
- *
- * For cpu_down() there might be valid reasons to finish cleanups which are
- * not required to be done under cpu_hotplug_lock, but that's a different
- * story and would be not invoked via this.
- */
-static void cpu_up_down_serialize_trainwrecks(bool tasks_frozen)
-{
-	/*
-	 * cpusets delegate hotplug operations to a worker to "solve" the
-	 * lock order problems. Wait for the worker, but only if tasks are
-	 * _not_ frozen (suspend, hibernate) as that would wait forever.
-	 *
-	 * The wait is required because otherwise the hotplug operation
-	 * returns with inconsistent state, which could even be observed in
-	 * user space when a new CPU is brought up. The CPU plug uevent
-	 * would be delivered and user space reacting on it would fail to
-	 * move tasks to the newly plugged CPU up to the point where the
-	 * work has finished because up to that point the newly plugged CPU
-	 * is not assignable in cpusets/cgroups. On unplug that's not
-	 * necessarily a visible issue, but it is still inconsistent state,
-	 * which is the real problem which needs to be "fixed". This can't
-	 * prevent the transient state between scheduling the work and
-	 * returning from waiting for it.
-	 */
-	if (!tasks_frozen)
-		cpuset_wait_for_hotplug();
-}
-
 #ifdef CONFIG_HOTPLUG_CPU
 #ifndef arch_clear_mm_cpumask_cpu
 #define arch_clear_mm_cpumask_cpu(cpu, mm) cpumask_clear_cpu(cpu, mm_cpumask(mm))
@@ -1127,7 +1087,6 @@ out:
 		cpu_notify_nofail(CPU_POST_DEAD, cpu);
 	arch_smt_update();
 	return ret;
-	cpu_up_down_serialize_trainwrecks(tasks_frozen);
 }
 
 static int cpu_down_maps_locked(unsigned int cpu, enum cpuhp_state target)
@@ -1139,16 +1098,7 @@ static int cpu_down_maps_locked(unsigned int cpu, enum cpuhp_state target)
 
 static int do_cpu_down(unsigned int cpu, enum cpuhp_state target)
 {
-	struct cpumask newmask;
 	int err;
-
-	cpumask_andnot(&newmask, cpu_online_mask, cpumask_of(cpu));
-
-	/* One big cluster CPU and one little cluster CPU must remain online */
-	if (!cpumask_intersects(&newmask, cpu_perf_mask) ||
-	    !cpumask_intersects(&newmask, cpu_lp_mask))
-		return -EINVAL;
-
 
 	cpu_maps_update_begin();
 	err = cpu_down_maps_locked(cpu, target);
@@ -1266,7 +1216,6 @@ out:
 	trace_cpuhp_latency(cpu, 1, start_time, ret);
 	cpu_hotplug_done();
 	arch_smt_update();
-	cpu_up_down_serialize_trainwrecks(tasks_frozen);
 	return ret;
 }
 
@@ -1357,7 +1306,6 @@ int freeze_secondary_cpus(int primary)
 {
 	int cpu, error = 0;
 
-	unaffine_perf_irqs();
 	cpu_maps_update_begin();
 	if (!cpu_online(primary))
 		primary = cpumask_first(cpu_online_mask);
@@ -1367,17 +1315,10 @@ int freeze_secondary_cpus(int primary)
 	 */
 	cpumask_clear(frozen_cpus);
 
-	pr_debug("Disabling non-boot CPUs ...\n");
+	pr_info("Disabling non-boot CPUs ...\n");
 	for_each_online_cpu(cpu) {
 		if (cpu == primary)
 			continue;
-
-		if (pm_wakeup_pending()) {
-			pr_info("Wakeup pending. Abort CPU freeze\n");
-			error = -EBUSY;
-			break;
-		}
-
 		trace_suspend_resume(TPS("CPU_OFF"), cpu, true);
 		error = _cpu_down(cpu, 1, CPUHP_OFFLINE);
 		trace_suspend_resume(TPS("CPU_OFF"), cpu, false);
@@ -1424,7 +1365,7 @@ void enable_nonboot_cpus(void)
 	if (cpumask_empty(frozen_cpus))
 		goto out;
 
-	pr_debug("Enabling non-boot CPUs ...\n");
+	pr_info("Enabling non-boot CPUs ...\n");
 
 	arch_enable_nonboot_cpus_begin();
 
@@ -1433,7 +1374,7 @@ void enable_nonboot_cpus(void)
 		error = _cpu_up(cpu, 1, CPUHP_ONLINE);
 		trace_suspend_resume(TPS("CPU_ON"), cpu, false);
 		if (!error) {
-			pr_debug("CPU%d is up\n", cpu);
+			pr_info("CPU%d is up\n", cpu);
 			cpu_device = get_cpu_device(cpu);
 			if (!cpu_device)
 				pr_err("%s: failed to get cpu%d device\n",
@@ -1450,7 +1391,6 @@ void enable_nonboot_cpus(void)
 	cpumask_clear(frozen_cpus);
 out:
 	cpu_maps_update_done();
-	reaffine_perf_irqs();
 }
 
 static int __init alloc_frozen_cpus(void)
