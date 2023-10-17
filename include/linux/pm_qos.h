@@ -8,6 +8,7 @@
 #include <linux/notifier.h>
 #include <linux/miscdevice.h>
 #include <linux/device.h>
+#include <linux/workqueue.h>
 #include <linux/cpumask.h>
 #include <linux/interrupt.h>
 
@@ -40,6 +41,7 @@ enum pm_qos_flags_status {
 #define PM_QOS_LATENCY_TOLERANCE_NO_CONSTRAINT	(-1)
 #define PM_QOS_LATENCY_ANY			((s32)(~(__u32)0 >> 1))
 
+extern void msm_cpuidle_set_sleep_disable(bool disable);
 #define PM_QOS_FLAG_NO_POWER_OFF	(1 << 0)
 #define PM_QOS_FLAG_REMOTE_WAKEUP	(1 << 1)
 
@@ -53,7 +55,7 @@ enum pm_qos_req_type {
 
 struct pm_qos_request {
 	enum pm_qos_req_type type;
-	atomic_t cpus_affine;
+	struct cpumask cpus_affine;
 #ifdef CONFIG_SMP
 	uint32_t irq;
 	/* Internal structure members */
@@ -61,6 +63,7 @@ struct pm_qos_request {
 #endif
 	struct plist_node node;
 	int pm_qos_class;
+	struct delayed_work work; /* for pm_qos_update_request_timeout */
 };
 
 struct pm_qos_flags_request {
@@ -141,6 +144,8 @@ void pm_qos_add_request(struct pm_qos_request *req, int pm_qos_class,
 			s32 value);
 void pm_qos_update_request(struct pm_qos_request *req,
 			   s32 new_value);
+void pm_qos_update_request_timeout(struct pm_qos_request *req,
+				   s32 new_value, unsigned long timeout_us);
 void pm_qos_remove_request(struct pm_qos_request *req);
 
 int pm_qos_request(int pm_qos_class);
