@@ -80,7 +80,6 @@
 #include <linux/sysctl.h>
 #include <linux/kcov.h>
 #include <linux/cpufreq_times.h>
-#include <linux/devfreq_boost.h>
 
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
@@ -199,7 +198,7 @@ static unsigned long *alloc_thread_stack_node(struct task_struct *tsk, int node)
 
 	stack = __vmalloc_node_range(THREAD_SIZE, THREAD_SIZE,
 				     VMALLOC_START, VMALLOC_END,
-				     THREADINFO_GFP,
+				     THREADINFO_GFP | __GFP_HIGHMEM,
 				     PAGE_KERNEL,
 				     0, node, __builtin_return_address(0));
 
@@ -346,8 +345,6 @@ void put_task_stack(struct task_struct *tsk)
 
 void free_task(struct task_struct *tsk)
 {
-	cpufreq_task_times_exit(tsk);
-
 #ifndef CONFIG_THREAD_INFO_IN_TASK
 	/*
 	 * The task is finally done with both the stack and thread_info,
@@ -360,6 +357,9 @@ void free_task(struct task_struct *tsk)
 	 * by now.
 	 */
 	WARN_ON_ONCE(atomic_read(&tsk->stack_refcount) != 0);
+#endif
+#ifdef CONFIG_CPU_FREQ_STAT
+	cpufreq_task_times_exit(tsk);
 #endif
 	rt_mutex_debug_task_free(tsk);
 	ftrace_graph_exit_task(tsk);
@@ -419,10 +419,10 @@ static void set_max_threads(unsigned int max_threads_suggested)
 	 * The number of threads shall be limited such that the thread
 	 * structures may only consume a small part of the available memory.
 	 */
-	if (fls64(totalram_pages()) + fls64(PAGE_SIZE) > 64)
+	if (fls64(totalram_pages) + fls64(PAGE_SIZE) > 64)
 		threads = MAX_THREADS;
 	else
-		threads = div64_u64((u64) totalram_pages() * (u64) PAGE_SIZE,
+		threads = div64_u64((u64) totalram_pages * (u64) PAGE_SIZE,
 				    (u64) THREAD_SIZE * 8UL);
 
 	if (threads > max_threads_suggested)
@@ -2104,9 +2104,6 @@ long _do_fork(unsigned long clone_flags,
 	struct task_struct *p;
 	int trace = 0;
 	long nr;
-
-	/* Boost CPU to the max for 1250 ms when userspace launches an app */
-		devfreq_boost_kick_max(DEVFREQ_MSM_CPUBW, 1250);
 
 	/*
 	 * Determine whether and which event to report to ptracer.  When
