@@ -62,30 +62,29 @@ archive_builtin()
 	fi
 }
 
-# If CONFIG_LTO_CLANG is selected, generate a linker script to ensure correct
-# ordering of initcalls, and with CONFIG_MODVERSIONS also enabled, collect the
-# previously generated symbol versions into the same script.
-lto_lds()
+# If CONFIG_LTO_CLANG is selected, collect generated symbol versions into
+# .tmp_symversions
+modversions()
 {
 	if [ -z "${CONFIG_LTO_CLANG}" ]; then
 		return
 	fi
 
-	${srctree}/scripts/generate_initcall_order.pl \
-		built-in.o ${KBUILD_VMLINUX_LIBS} \
-		> .tmp_lto.lds
-
-	if [ -n "${CONFIG_MODVERSIONS}" ]; then
-		for a in built-in.o ${KBUILD_VMLINUX_LIBS}; do
-			for o in $(${AR} t $a); do
-				if [ -f ${o}.symversions ]; then
-					cat ${o}.symversions >> .tmp_lto.lds
-				fi
-			done
-		done
+	if [ -z "${CONFIG_MODVERSIONS}" ]; then
+		return
 	fi
 
-	echo "-T .tmp_lto.lds"
+	rm -f .tmp_symversions
+
+	for a in built-in.o ${KBUILD_VMLINUX_LIBS}; do
+		for o in $(${AR} t $a); do
+			if [ -f ${o}.symversions ]; then
+				cat ${o}.symversions >> .tmp_symversions
+			fi
+		done
+	done
+
+	echo "-T .tmp_symversions"
 }
 
 # Link of vmlinux.o used for section mismatch analysis
@@ -111,7 +110,7 @@ modpost_link()
 		info LD vmlinux.o
 	fi
 
-	${LD} ${LDFLAGS} -r -o ${1} $(lto_lds) ${objects}
+	${LD} ${LDFLAGS} -r -o ${1} $(modversions) ${objects}
 }
 
 # If CONFIG_LTO_CLANG is selected, we postpone running recordmcount until
@@ -201,7 +200,7 @@ kallsyms()
 
 	local afile="`basename ${2} .o`.S"
 
-	${NM} -n ${1} | scripts/kallsyms ${kallsymopt} > ${afile}
+	${NM} -n ${1} 2>/dev/null | scripts/kallsyms ${kallsymopt} > ${afile}
 	${CC} ${aflags} -c -o ${2} ${afile}
 }
 
@@ -249,7 +248,7 @@ cleanup()
 	rm -f .tmp_System.map
 	rm -f .tmp_kallsyms*
 	rm -f .tmp_version
-	rm -f .tmp_lto.lds
+	rm -f .tmp_symversions
 	rm -f .tmp_vmlinux*
 	rm -f built-in.o
 	rm -f System.map
@@ -352,14 +351,10 @@ if [ -n "${CONFIG_KALLSYMS}" ]; then
 	#     the right size, but due to the added section, some
 	#     addresses have shifted.
 	#     From here, we generate a correct .tmp_kallsyms2.o
-	# 3)  That link may have expanded the kernel image enough that
-	#     more linker branch stubs / trampolines had to be added, which
-	#     introduces new names, which further expands kallsyms. Do another
-	#     pass if that is the case. In theory it's possible this results
-	#     in even more stubs, but unlikely.
-	#     KALLSYMS_EXTRA_PASS=1 may also used to debug or work around
-	#     other bugs.
-	# 4)  The correct ${kallsymso} is linked into the final vmlinux.
+	# 2a) We may use an extra pass as this has been necessary to
+	#     woraround some alignment related bugs.
+	#     KALLSYMS_EXTRA_PASS=1 is used to trigger this.
+	# 3)  The correct ${kallsymso} is linked into the final vmlinux.
 	#
 	# a)  Verify that the System.map from vmlinux matches the map from
 	#     ${kallsymso}.
@@ -375,11 +370,8 @@ if [ -n "${CONFIG_KALLSYMS}" ]; then
 	vmlinux_link .tmp_kallsyms1.o .tmp_vmlinux2
 	kallsyms .tmp_vmlinux2 .tmp_kallsyms2.o
 
-	# step 3
-	size1=$(stat -c "%s" .tmp_kallsyms1.o)
-	size2=$(stat -c "%s" .tmp_kallsyms2.o)
-
-	if [ $size1 -ne $size2 ] || [ -n "${KALLSYMS_EXTRA_PASS}" ]; then
+	# step 2a
+	if [ -n "${KALLSYMS_EXTRA_PASS}" ]; then
 		kallsymso=.tmp_kallsyms3.o
 		kallsyms_vmlinux=.tmp_vmlinux3
 
