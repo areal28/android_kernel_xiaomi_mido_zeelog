@@ -2273,7 +2273,7 @@ int write_one_page(struct page *page, int wait);
 void task_dirty_inc(struct task_struct *tsk);
 
 /* readahead.c */
-#define VM_MAX_READAHEAD	128	/* kbytes */
+#define VM_MAX_READAHEAD	512	/* kbytes */
 #define VM_MIN_READAHEAD	16	/* kbytes (includes current page) */
 
 int force_page_cache_readahead(struct address_space *mapping, struct file *filp,
@@ -2501,6 +2501,7 @@ extern int sysctl_drop_caches;
 int drop_caches_sysctl_handler(struct ctl_table *, int,
 					void __user *, size_t *, loff_t *);
 #endif
+void mm_drop_caches(int val);
 
 void drop_slab(void);
 void drop_slab_node(int nid);
@@ -2648,7 +2649,7 @@ static inline void setup_nr_node_ids(void) {}
 
 extern int want_old_faultaround_pte;
 
-#ifdef CONFIG_PROCESS_RECLAIM
+#if defined(CONFIG_PROCESS_RECLAIM) || defined(CONFIG_PRLMK)
 struct reclaim_param {
 	struct vm_area_struct *vma;
 	/* Number of pages scanned */
