@@ -240,10 +240,8 @@ int msm_gem_mmap_obj(struct drm_gem_object *obj,
 		 * address_space (so unmap_mapping_range does what we want,
 		 * in particular in the case of mmap'd dmabufs)
 		 */
-		fput(vma->vm_file);
-		get_file(obj->filp);
 		vma->vm_pgoff = 0;
-		vma->vm_file  = obj->filp;
+		vma_set_file(vma, obj->filp);
 
 		vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 	}
@@ -1096,8 +1094,4 @@ struct drm_gem_object *msm_gem_import(struct drm_device *dev,
 	msm_obj->pages = NULL;
 
 	return obj;
-
-fail:
-	drm_gem_object_unreference_unlocked(obj);
-	return ERR_PTR(ret);
 }

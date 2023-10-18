@@ -21,6 +21,7 @@
 
 #include <linux/msm_ion.h>
 #include <linux/pm_domain.h>
+#include <linux/pm_qos.h>
 
 #include "msm_drv.h"
 #include "msm_kms.h"
@@ -45,15 +46,27 @@
  * SDE_DEBUG - macro for kms/plane/crtc/encoder/connector logs
  * @fmt: Pointer to format string
  */
-#define SDE_DEBUG(fmt, ...) pr_debug(fmt, ##__VA_ARGS__)
+#define SDE_DEBUG(fmt, ...)                                                \
+	do {                                                               \
+		if (unlikely(drm_debug & DRM_UT_KMS))                      \
+			DRM_DEBUG(fmt, ##__VA_ARGS__); \
+		else                                                       \
+			pr_debug(fmt, ##__VA_ARGS__);                      \
+	} while (0)
 
 /**
  * SDE_DEBUG_DRIVER - macro for hardware driver logging
  * @fmt: Pointer to format string
  */
-#define SDE_DEBUG_DRIVER(fmt, ...) pr_debug(fmt, ##__VA_ARGS__)
+#define SDE_DEBUG_DRIVER(fmt, ...)                                         \
+	do {                                                               \
+		if (unlikely(drm_debug & DRM_UT_DRIVER))                   \
+			DRM_ERROR(fmt, ##__VA_ARGS__); \
+		else                                                       \
+			pr_debug(fmt, ##__VA_ARGS__);                      \
+	} while (0)
 
-#define SDE_ERROR(fmt, ...) pr_debug("[sde error]" fmt, ##__VA_ARGS__)
+#define SDE_ERROR(fmt, ...) pr_err("[sde error]" fmt, ##__VA_ARGS__)
 
 #define POPULATE_RECT(rect, a, b, c, d, Q16_flag) \
 	do {						\
@@ -228,6 +241,7 @@ struct sde_kms {
 
 	struct msm_gem_address_space *aspace[MSM_SMMU_DOMAIN_MAX];
 	struct sde_power_client *core_client;
+	struct pm_qos_request pm_qos_cpu_req;
 
 	struct ion_client *iclient;
 	struct sde_power_event *power_event;

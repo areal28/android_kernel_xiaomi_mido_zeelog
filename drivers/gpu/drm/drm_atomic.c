@@ -30,9 +30,9 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_mode.h>
 #include <drm/drm_plane_helper.h>
-#include <linux/sync_file.h>
-#include <linux/cpu_input_boost.h>
 #include <linux/devfreq_boost.h>
+#include <linux/sync_file.h>
+
 #include "drm_crtc_internal.h"
 
 static void crtc_commit_free(struct kref *kref)
@@ -863,10 +863,10 @@ static int drm_atomic_plane_check(struct drm_plane *plane,
 	int ret;
 
 	/* either *both* CRTC and FB must be set, or neither */
-	if (WARN_ON(state->crtc && !state->fb)) {
+	if (state->crtc && !state->fb) {
 		DRM_DEBUG_ATOMIC("CRTC set but no FB\n");
 		return -EINVAL;
-	} else if (WARN_ON(state->fb && !state->crtc)) {
+	} else if (state->fb && !state->crtc) {
 		DRM_DEBUG_ATOMIC("FB set but no CRTC\n");
 		return -EINVAL;
 	}
@@ -1905,11 +1905,8 @@ int drm_mode_atomic_ioctl(struct drm_device *dev,
 			(arg->flags & DRM_MODE_PAGE_FLIP_EVENT))
 		return -EINVAL;
 
-	if (!(arg->flags & DRM_MODE_ATOMIC_TEST_ONLY)) {
+	if (!(arg->flags & DRM_MODE_ATOMIC_TEST_ONLY))
 		devfreq_boost_kick(DEVFREQ_MSM_CPUBW);
-		cpu_input_boost_kick();
-
-	}
 
 	drm_modeset_acquire_init(&ctx, 0);
 
@@ -2011,13 +2008,10 @@ retry:
 		 * Below we call drm_atomic_state_free for it.
 		 */
 		ret = drm_atomic_check_only(state);
+	} else if (arg->flags & DRM_MODE_ATOMIC_NONBLOCK) {
+		ret = drm_atomic_nonblocking_commit(state);
 	} else {
-		drm_bridge_enable_all(dev);
-
-		if (arg->flags & DRM_MODE_ATOMIC_NONBLOCK)
-			ret = drm_atomic_nonblocking_commit(state);
-		else
-			ret = drm_atomic_commit(state);
+		ret = drm_atomic_commit(state);
 	}
 
 out:

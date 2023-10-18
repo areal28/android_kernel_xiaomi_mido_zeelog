@@ -1,5 +1,4 @@
 /* Copyright (c) 2016-2017, The Linux Foundation. All rights reserved.
- * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -84,15 +83,6 @@ _kgsl_pool_zero_page(struct page *p, unsigned int pool_order)
 static void
 _kgsl_pool_add_page(struct kgsl_page_pool *pool, struct page *p)
 {
-	/*
-	 * Sanity check to make sure we don't re-pool a page that
-	 * somebody else has a reference to.
-	 */
-	if (WARN_ON_ONCE(unlikely(page_count(p) > 1))) {
-		__free_pages(p, pool->pool_order);
-		return;
-	}
-
 	_kgsl_pool_zero_page(p, pool->pool_order);
 
 	llist_add((struct llist_node *)&p->lru, &pool->page_list);
@@ -132,25 +122,6 @@ static int kgsl_pool_size_total(void)
 
 	for (i = 0; i < kgsl_num_pools; i++)
 		total += kgsl_pool_size(&kgsl_pools[i]);
-	return total;
-}
-
-/* Returns the total number of pages in all pools excluding reserved pages */
-static unsigned long kgsl_pool_size_nonreserved(void)
-{
-	int i;
-	unsigned long total = 0;
-
-	for (i = 0; i < kgsl_num_pools; i++) {
-		struct kgsl_page_pool *pool = &kgsl_pools[i];
-
-		spin_lock(&pool->list_lock);
-		if (atomic_read(&pool->page_count) > pool->reserved_pages)
-			total += (atomic_read(&pool->page_count) - pool->reserved_pages) *
-					(1 << pool->pool_order);
-		spin_unlock(&pool->list_lock);
-	}
-
 	return total;
 }
 
@@ -456,7 +427,7 @@ bool kgsl_pool_avaialable(int page_size)
 		return true;
 
 	for (i = 0; i < kgsl_num_pools; i++)
-		if (get_order(page_size) == kgsl_pools[i].pool_order)
+		if (ilog2(page_size >> PAGE_SHIFT) == kgsl_pools[i].pool_order)
 			return true;
 
 	return false;
@@ -489,27 +460,20 @@ kgsl_pool_shrink_scan_objects(struct shrinker *shrinker,
 	/* nr represents number of pages to be removed*/
 	int nr = sc->nr_to_scan;
 	int total_pages = kgsl_pool_size_total();
-	unsigned long ret;
 
 	/* Target pages represents new  pool size */
 	int target_pages = (nr > total_pages) ? 0 : (total_pages - nr);
 
 	/* Reduce pool size to target_pages */
-	ret = kgsl_pool_reduce(target_pages, false);
-
-	/* If we are unable to shrink more, stop trying */
-	return (ret == 0) ? SHRINK_STOP : ret;
+	return kgsl_pool_reduce(target_pages, false);
 }
 
 static unsigned long
 kgsl_pool_shrink_count_objects(struct shrinker *shrinker,
 					struct shrink_control *sc)
 {
-	/*
-	 * Return non-reserved pool size as we don't
-	 * want shrinker to free reserved pages.
-	 */
-	return kgsl_pool_size_nonreserved();
+	/* Return total pool size as everything in pool can be freed */
+	return kgsl_pool_size_total();
 }
 
 /* Shrinker callback data*/
@@ -566,7 +530,7 @@ static void kgsl_of_parse_mempools(struct device_node *node)
 		allocation_allowed = of_property_read_bool(child,
 				"qcom,mempool-allocate");
 
-		kgsl_pool_config(get_order(page_size), reserved_pages,
+		kgsl_pool_config(ilog2(page_size >> PAGE_SHIFT), reserved_pages,
 				allocation_allowed);
 	}
 }
