@@ -157,7 +157,6 @@ static struct mux_div_clk a53ssmux_perf = {
 	},
 	.c = {
 		.dbg_name = "a53ssmux_perf",
-		.flags = CLKFLAG_NO_RATE_CACHE,
 		.ops = &clk_ops_mux_div_clk,
 		CLK_INIT(a53ssmux_perf.c),
 	},
@@ -179,7 +178,6 @@ static struct mux_div_clk a53ssmux_pwr = {
 	},
 	.c = {
 		.dbg_name = "a53ssmux_pwr",
-		.flags = CLKFLAG_NO_RATE_CACHE,
 		.ops = &clk_ops_mux_div_clk,
 		CLK_INIT(a53ssmux_pwr.c),
 	},
@@ -256,8 +254,8 @@ static int cpu_clk_8953_set_rate(struct clk *c, unsigned long rate)
 	 */
 	if (hw_low_power_ctrl) {
 		memset(&cpuclk->req, 0, sizeof(cpuclk->req));
-		atomic_set(&cpuclk->req.cpus_affine,
-			*cpumask_bits(&cpuclk->cpumask));
+		cpumask_copy(&cpuclk->req.cpus_affine,
+				(const struct cpumask *)&cpuclk->cpumask);
 		cpuclk->req.type = PM_QOS_REQ_AFFINE_CORES;
 		pm_qos_add_request(&cpuclk->req, PM_QOS_CPU_DMA_LATENCY,
 					cpuclk->cpu_latency_no_l2_pc_us);
