@@ -89,7 +89,7 @@ enum {
 	 * If flush has been pending longer than the following timeout,
 	 * it's issued even if flush_data requests are still in flight.
 	 */
-	FLUSH_PENDING_TIMEOUT	= 5 * HZ,
+	FLUSH_PENDING_TIMEOUT	= 5000,
 };
 
 static bool blk_kick_flush(struct request_queue *q,
@@ -302,7 +302,7 @@ static bool blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq)
 	/* C2 and C3 */
 	if (!list_empty(&fq->flush_data_in_flight) &&
 	    time_before(jiffies,
-			fq->flush_pending_since + FLUSH_PENDING_TIMEOUT))
+			fq->flush_pending_since + msecs_to_jiffies(FLUSH_PENDING_TIMEOUT)))
 		return false;
 
 	/*
@@ -529,46 +529,6 @@ int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask,
 	return ret;
 }
 EXPORT_SYMBOL(blkdev_issue_flush);
-
-/**
- * blkdev_issue_flush_nowait - queue a flush
- * @bdev:	blockdev to issue flush for
- * @gfp_mask:	memory allocation flags (for bio_alloc)
- *
- * Description:
- *    Issue a flush for the block device in question. Caller can supply
- *    room for storing the error offset in case of a flush error, if they
- *    wish to. If WAIT flag is not passed then caller may check only what
- *    request was pushed in some internal queue for later handling.
- */
-void blkdev_issue_flush_nowait(struct block_device *bdev, gfp_t gfp_mask)
-{
-	struct request_queue *q;
-	struct bio *bio;
-
-	if (bdev->bd_disk == NULL)
-		return;
-
-	q = bdev_get_queue(bdev);
-	if (!q)
-		return;
-
-	/*
-	 * some block devices may not have their queue correctly set up here
-	 * (e.g. loop device without a backing file) and so issuing a flush
-	 * here will panic. Ensure there is a request function before issuing
-	 * the flush.
-	 */
-	if (!q->make_request_fn)
-		return;
-
-	bio = bio_alloc(gfp_mask, 0);
-	bio->bi_bdev = bdev;
-	bio->bi_opf = REQ_OP_WRITE | REQ_PREFLUSH;
-
-	submit_bio_nowait(bio);
-}
-EXPORT_SYMBOL(blkdev_issue_flush_nowait);
 
 struct blk_flush_queue *blk_alloc_flush_queue(struct request_queue *q,
 		int node, int cmd_size)

@@ -220,6 +220,8 @@ EXPORT_SYMBOL(blk_start_queue_async);
  **/
 void blk_start_queue(struct request_queue *q)
 {
+	WARN_ON(!in_interrupt() && !irqs_disabled());
+
 	queue_flag_clear(QUEUE_FLAG_STOPPED, q);
 	__blk_run_queue(q);
 }
@@ -307,7 +309,9 @@ inline void __blk_run_queue_uncond(struct request_queue *q)
 	 * can wait until all these request_fn calls have finished.
 	 */
 	q->request_fn_active++;
+        preempt_disable();
 	q->request_fn(q);
+        preempt_enable();
 	q->request_fn_active--;
 }
 EXPORT_SYMBOL_GPL(__blk_run_queue_uncond);
@@ -1254,11 +1258,7 @@ retry:
 	trace_block_sleeprq(q, bio, op);
 
 	spin_unlock_irq(q->queue_lock);
-	/*
-	 * FIXME: this should be io_schedule().  The timeout is there as a
-	 * workaround for some io timeout problems.
-	 */
-	io_schedule_timeout(5*HZ);
+	io_schedule();
 
 	/*
 	 * After sleeping, we become a "batching" process and will be able
@@ -1293,9 +1293,6 @@ static struct request *blk_old_get_request(struct request_queue *q, int rw,
 	/* q->queue_lock is unlocked at this point */
 	rq->__data_len = 0;
 	rq->__sector = (sector_t) -1;
-#ifdef CONFIG_PFK
-	rq->__dun = 0;
-#endif
 	rq->bio = rq->biotail = NULL;
 	return rq;
 }
@@ -1537,7 +1534,7 @@ bool bio_attempt_front_merge(struct request_queue *q, struct request *req,
 	req->bio = bio;
 
 #ifdef CONFIG_PFK
-	req->__dun = bio->bi_iter.bi_dun;
+	WARN_ON(req->__dun || bio->bi_iter.bi_dun);
 #endif
 	req->__sector = bio->bi_iter.bi_sector;
 	req->__data_len += bio->bi_iter.bi_size;
