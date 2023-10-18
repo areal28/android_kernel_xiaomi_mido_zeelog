@@ -31,6 +31,7 @@
 #include <linux/suspend.h>
 #include <trace/events/power.h>
 #include <linux/cpufreq.h>
+#include <linux/cpuidle.h>
 #include <linux/timer.h>
 #include <linux/wakeup_reason.h>
 
@@ -123,6 +124,10 @@ void device_pm_unlock(void)
  */
 void device_pm_add(struct device *dev)
 {
+	/* Skip PM setup/initialization. */
+	if (device_pm_not_required(dev))
+		return;
+
 	pr_debug("PM: Adding info for %s:%s\n",
 		 dev->bus ? dev->bus->name : "No Bus", dev_name(dev));
 	device_pm_check_callbacks(dev);
@@ -140,6 +145,9 @@ void device_pm_add(struct device *dev)
  */
 void device_pm_remove(struct device *dev)
 {
+	if (device_pm_not_required(dev))
+		return;
+
 	pr_debug("PM: Removing info for %s:%s\n",
 		 dev->bus ? dev->bus->name : "No Bus", dev_name(dev));
 	complete_all(&dev->power.completion);
@@ -370,7 +378,7 @@ static void dpm_show_time(ktime_t starttime, pm_message_t state, char *info)
 	usecs = usecs64;
 	if (usecs == 0)
 		usecs = 1;
-	pr_debug("PM: %s%s%s of devices complete after %ld.%03ld msecs\n",
+	pr_info("PM: %s%s%s of devices complete after %ld.%03ld msecs\n",
 		info ?: "", info ? " " : "", pm_verb(state.event),
 		usecs / USEC_PER_MSEC, usecs % USEC_PER_MSEC);
 }
@@ -439,7 +447,7 @@ static void dpm_watchdog_set(struct dpm_watchdog *wd, struct device *dev)
 
 	init_timer_on_stack(timer);
 	/* use same timeout value for both suspend and resume */
-	timer->expires = jiffies + msecs_to_jiffies(1000) * CONFIG_DPM_WATCHDOG_TIMEOUT;
+	timer->expires = jiffies + HZ * CONFIG_DPM_WATCHDOG_TIMEOUT;
 	timer->function = dpm_watchdog_handler;
 	timer->data = (unsigned long)wd;
 	add_timer(timer);
@@ -591,6 +599,7 @@ void dpm_resume_noirq(pm_message_t state)
 	dpm_show_time(starttime, state, "noirq");
 	resume_device_irqs();
 	device_wakeup_disarm_wake_irqs();
+	cpuidle_resume();
 	trace_suspend_resume(TPS("dpm_resume_noirq"), state.event, false);
 }
 
@@ -669,6 +678,10 @@ void dpm_resume_early(pm_message_t state)
 {
 	struct device *dev;
 	ktime_t starttime = ktime_get();
+
+#ifdef CONFIG_BOEFFLA_WL_BLOCKER
+	pm_print_active_wakeup_sources();
+#endif
 
 	trace_suspend_resume(TPS("dpm_resume_early"), state.event, true);
 	mutex_lock(&dpm_list_mtx);
@@ -1059,11 +1072,13 @@ static int __device_suspend_noirq(struct device *dev, pm_message_t state, bool a
 	}
 
 	error = dpm_run_callback(callback, dev, state, info);
-	if (!error)
+	if (!error) {
 		dev->power.is_noirq_suspended = true;
-	else
+	} else {
+		log_suspend_abort_reason("Callback failed on %s in %pF returned %d",
+					 dev_name(dev), callback, error);
 		async_error = error;
-
+	}
 Complete:
 	complete_all(&dev->power.completion);
 	TRACE_SUSPEND(error);
@@ -1109,6 +1124,7 @@ int dpm_suspend_noirq(pm_message_t state)
 	int error = 0;
 
 	trace_suspend_resume(TPS("dpm_suspend_noirq"), state.event, true);
+	cpuidle_pause();
 	device_wakeup_arm_wake_irqs();
 	suspend_device_irqs();
 	mutex_lock(&dpm_list_mtx);
@@ -1205,11 +1221,13 @@ static int __device_suspend_late(struct device *dev, pm_message_t state, bool as
 	}
 
 	error = dpm_run_callback(callback, dev, state, info);
-	if (!error)
+	if (!error) {
 		dev->power.is_late_suspended = true;
-	else
+	} else {
+		log_suspend_abort_reason("Callback failed on %s in %pF returned %d",
+					 dev_name(dev), callback, error);
 		async_error = error;
-
+	}
 Complete:
 	TRACE_SUSPEND(error);
 	complete_all(&dev->power.completion);
@@ -1351,7 +1369,6 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 	pm_callback_t callback = NULL;
 	char *info = NULL;
 	int error = 0;
-	char suspend_abort[MAX_SUSPEND_ABORT_LEN];
 	DECLARE_DPM_WATCHDOG_ON_STACK(wd);
 
 	TRACE_DEVICE(dev);
@@ -1378,9 +1395,6 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 	pm_runtime_barrier(dev);
 
 	if (pm_wakeup_pending()) {
-		pm_get_active_wakeup_sources(suspend_abort,
-			MAX_SUSPEND_ABORT_LEN);
-		log_suspend_abort_reason(suspend_abort);
 		dev->power.direct_complete = false;
 		async_error = -EBUSY;
 		goto Complete;
@@ -1467,16 +1481,19 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
 
 			spin_unlock_irq(&parent->power.lock);
 		}
+	} else {
+		log_suspend_abort_reason("Callback failed on %s in %pF returned %d",
+					 dev_name(dev), callback, error);
 	}
 
 	device_unlock(dev);
 	dpm_watchdog_clear(&wd);
 
  Complete:
+	complete_all(&dev->power.completion);
 	if (error)
 		async_error = error;
 
-	complete_all(&dev->power.completion);
 	TRACE_SUSPEND(error);
 	return error;
 }
@@ -1676,7 +1693,9 @@ int dpm_prepare(pm_message_t state)
 			printk(KERN_INFO "PM: Device %s not prepared "
 				"for power transition: code %d\n",
 				dev_name(dev), error);
-			dpm_save_failed_dev(dev_name(dev));
+			log_suspend_abort_reason("Device %s not prepared "
+						 "for power transition: code %d",
+						 dev_name(dev), error);
 			put_device(dev);
 			break;
 		}
